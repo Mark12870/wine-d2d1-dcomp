@@ -9,7 +9,8 @@ output=$(realpath -m "$2")
 export PATH=/usr/lib/sdk/llvm20/bin:$PATH
 
 version=$(git -C "$source" describe --tags --match 'wine-*' HEAD)
-name=wine-d2d1-dcomp-${version#wine-}
+short=${version%-g*}
+name=wine-d2d1-dcomp-${short#wine-}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

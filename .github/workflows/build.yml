@@ -36,9 +36,15 @@ jobs:
         run: |
           git clone --quiet --filter=blob:none --no-checkout --branch "$BRANCH" "$UPSTREAM" src
           commit=$(git -C src rev-parse "${WANTED:-HEAD}^{commit}")
-          version=$(git -C src describe --tags --match 'wine-*' "$commit")
+          described=$(git -C src describe --tags --match 'wine-*' "$commit")
+          short=${described%-g*}
+          version=wine-d2d1-dcomp-${short#wine-}
           released=false
-          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if notes=$(gh release view "$version" --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null); then
+              if [[ "$notes" != *"$commit"* ]]; then
+                  echo "::error::$version is already released from another commit; was the branch rewritten?"
+                  exit 1
+              fi
               released=true
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
