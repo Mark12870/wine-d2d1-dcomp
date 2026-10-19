@@ -1,0 +1,94 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: giang17/wine commit to build (the branch head when empty)
+        required: false
+        default: ''
+
+env:
+  UPSTREAM: https://github.com/giang17/wine.git
+  BRANCH: d2d1-dcomp-11.0
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      - name: Find the commit and its version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.commit }}
+        run: |
+          git clone --quiet --filter=blob:none --no-checkout --branch "$BRANCH" "$UPSTREAM" src
+          commit=$(git -C src rev-parse "${WANTED:-HEAD}^{commit}")
+          version=$(git -C src describe --tags --match 'wine-*' "$commit")
+          released=false
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              released=true
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "released=$released" >> "$GITHUB_OUTPUT"
+          echo "::notice::$version ($commit), released: $released"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.released == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the SDK and LLVM
+        run: flatpak install -y --noninteractive flathub org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm20//25.08
+
+      - name: Fetch the source
+        run: |
+          git clone --quiet --filter=blob:none --branch "$BRANCH" "$UPSTREAM" src
+          git -C src checkout --quiet "${{ needs.resolve.outputs.commit }}"
+
+      - name: Build
+        run: |
+          mkdir -p tmp
+          flatpak run --filesystem="$PWD" --env=TMPDIR="$PWD/tmp" --command=bash org.gnome.Sdk//50 \
+              ./build.sh src dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --title "$VERSION" --notes \
+              "Built from [giang17/wine@${COMMIT:0:11}](https://github.com/giang17/wine/commit/$COMMIT) on \`$BRANCH\`, in org.gnome.Sdk//50 with LLVM 20. The source it was built from is attached."
