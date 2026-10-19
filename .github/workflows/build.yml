@@ -12,6 +12,10 @@ on:
         required: false
         default: ''
 
+concurrency:
+  group: build
+  cancel-in-progress: false
+
 env:
   UPSTREAM: https://github.com/giang17/wine.git
   BRANCH: d2d1-dcomp-11.0
