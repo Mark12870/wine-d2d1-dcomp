@@ -24,6 +24,10 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       released: ${{ steps.version.outputs.released }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Find the commit and its version
         id: version
         env:
@@ -35,6 +39,10 @@ jobs:
           described=$(git -C src describe --tags --match 'wine-*' "$commit")
           short=${described%-g*}
           version=wine-d2d1-dcomp-${short#wine-}
+          level=$(git rev-list --count HEAD -- patches)
+          if [ "$level" -gt 0 ]; then
+              version=$version-p$level
+          fi
           released=false
           if notes=$(gh release view "$version" --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null); then
               if [[ "$notes" != *"$commit"* ]]; then
@@ -58,6 +66,8 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install the SDK and LLVM
         run: flatpak install -y --noninteractive flathub org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm20//25.08
@@ -98,4 +108,4 @@ jobs:
           COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --title "$VERSION" --notes \
-              "Built from [giang17/wine@${COMMIT:0:11}](https://github.com/giang17/wine/commit/$COMMIT) on \`$BRANCH\`, in org.gnome.Sdk//50 with LLVM 20. The source it was built from is attached."
+              "Built from [giang17/wine@${COMMIT:0:11}](https://github.com/giang17/wine/commit/$COMMIT) on \`$BRANCH\` with [this repository's patches](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA/patches), in org.gnome.Sdk//50 with LLVM 20. The source it was built from is attached, with the patches."

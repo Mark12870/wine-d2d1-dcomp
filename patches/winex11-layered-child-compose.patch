@@ -1,0 +1,279 @@
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -372,6 +372,9 @@
+ extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
+ extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
+ extern void x11drv_client_surface_reblit( HWND toplevel );
++extern BOOL is_ulw_child( HWND hwnd );
++extern struct window_surface *get_composed_surface( HWND hwnd );
++extern void x11drv_client_surface_represent_parent( HWND child );
+ extern Window x11drv_client_surface_create( HWND hwnd, int format, struct client_surface **client );
+ 
+ /**************************************************************************
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -674,12 +674,103 @@
+     return changed;
+ }
+ 
++/* A layered child painted through UpdateLayeredWindow() (Windows 8 and later) is
++ * composed by the DWM over whatever its parent presents, alpha included.  Here it
++ * has no X window of its own (X11DRV_CreateWindowSurface()): an X window would be
++ * a separate top-level that the window manager places anywhere, and the parent's
++ * visible region would lose the child's rectangle all the same.  The iZotope
++ * "Glass" plug-in editors show their consent and authorisation dialogs this way
++ * over an OpenGL canvas, and both came up black with the dialog nowhere to be
++ * seen.  Compose it in the parent's present instead. */
++BOOL is_ulw_child( HWND hwnd )
++{
++    HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
++
++    if (!parent || parent == NtUserGetDesktopWindow()) return FALSE;
++    if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED)) return FALSE;
++    return !NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, NULL );
++}
++
++/* the visible layered children of hwnd, bottom-most first, with their window
++ * rects in hwnd's client coordinates */
++static UINT get_ulw_children( HWND hwnd, UINT dpi, HWND *children, RECT *rects, UINT max )
++{
++    HWND child, list[64];
++    UINT count = 0, i = 0;
++
++    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child && i < ARRAY_SIZE(list);
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++        list[i++] = child;
++
++    while (i-- && count < max)
++    {
++        if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
++        if (!is_ulw_child( list[i] )) continue;
++        if (!NtUserGetWindowRect( list[i], &rects[count], dpi )) continue;
++        NtUserMapWindowPoints( 0, hwnd, (POINT *)&rects[count], 2, dpi );
++        children[count++] = list[i];
++    }
++    return count;
++}
++
++static void blend_ulw_child( HDC hdc, HWND child, const RECT *rect )
++{
++    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
++    struct window_surface *surface;
++    int width, height;
++    HBITMAP previous;
++    HDC src;
++
++    if (!(surface = get_composed_surface( child ))) return;
++    width = min( rect->right - rect->left, surface->rect.right - surface->rect.left );
++    height = min( rect->bottom - rect->top, surface->rect.bottom - surface->rect.top );
++    if ((src = NtGdiCreateCompatibleDC( 0 )))
++    {
++        window_surface_lock( surface );
++        previous = NtGdiSelectBitmap( src, surface->color_bitmap );
++        NtGdiAlphaBlend( hdc, rect->left, rect->top, width, height, src, 0, 0, width, height, *(DWORD *)&blend, 0 );
++        NtGdiSelectBitmap( src, previous );
++        window_surface_unlock( surface );
++        NtGdiDeleteObjectApp( src );
++    }
++    window_surface_release( surface );
++}
++
++/* repeat the last present of the parent of a layered child, so a change of the
++ * child shows without waiting for the parent's next frame */
++void x11drv_client_surface_represent_parent( HWND child )
++{
++    struct x11drv_client_surface *surface, *pending[16];
++    HWND parent = NtUserGetAncestor( child, GA_PARENT );
++    unsigned int i, count = 0;
++
++    pthread_mutex_lock( &client_surfaces_x11_lock );
++    LIST_FOR_EACH_ENTRY( surface, &client_surfaces_x11, struct x11drv_client_surface, entry )
++    {
++        if (count == ARRAY_SIZE(pending)) break;
++        if (surface->client.hwnd != parent || !surface->hdc_dst) continue;
++        if (!InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )) continue;
++        client_surface_add_ref( &surface->client );
++        pending[count++] = surface;
++    }
++    pthread_mutex_unlock( &client_surfaces_x11_lock );
++
++    for (i = 0; i < count; i++)
++    {
++        TRACE( "presenting %s again for layered child %p\n", debugstr_client_surface( &pending[i]->client ), child );
++        client_surface_present( &pending[i]->client );
++        client_surface_release( &pending[i]->client );
++    }
++}
++
+ static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
+ {
+     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+     struct x11drv_win_data *data;
+-    RECT rect_dst, rect;
++    RECT rect_dst, rect, ulw_rects[8];
++    HWND ulw_children[8];
++    UINT i, ulw_count = 0;
+     Drawable window;
+     HRGN region;
+ 
+@@ -704,6 +795,18 @@
+     {
+         region = get_dc_monitor_region( hwnd, hdc ); /* otherwise use the window region for clipping rules */
+         if (!NtUserGetClientRect( hwnd, &rect_dst, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) )) goto done;
++        /* the parent presents below its layered children, see is_ulw_child() */
++        if (region) ulw_count = get_ulw_children( hwnd, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ),
++                                                  ulw_children, ulw_rects, ARRAY_SIZE(ulw_rects) );
++        for (i = 0; i < ulw_count; i++)
++        {
++            HRGN child_region;
++
++            if (!intersect_rect( &rect, &ulw_rects[i], &rect_dst )) continue;
++            if (!(child_region = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom ))) continue;
++            NtGdiCombineRgn( region, region, child_region, RGN_OR );
++            NtGdiDeleteObjectApp( child_region );
++        }
+         NtUserMapWindowPoints( hwnd, toplevel, (POINT *)&rect_dst, 2, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) );
+     }
+ 
+@@ -734,6 +837,7 @@
+ 
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
++    for (i = 0; i < ulw_count; i++) blend_ulw_child( surface->hdc_dst, ulw_children[i], &ulw_rects[i] );
+     XFlush( gdi_display );
+ 
+     /* The top-level may not be viewable yet - the window manager is still
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -2052,6 +2052,87 @@
+     return FALSE;
+ }
+ 
++/* A layered child has no X window: its image stays in a surface of its own and
++ * is composed over its parent's presents, see is_ulw_child(). */
++static pthread_mutex_t composed_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct window_surface *composed_surfaces[32];
++
++static void composed_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static BOOL composed_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
++                                    const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                    const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    return TRUE;
++}
++
++static void composed_surface_destroy( struct window_surface *surface )
++{
++    unsigned int i;
++
++    pthread_mutex_lock( &composed_mutex );
++    for (i = 0; i < ARRAY_SIZE(composed_surfaces); i++)
++        if (composed_surfaces[i] == surface) composed_surfaces[i] = NULL;
++    pthread_mutex_unlock( &composed_mutex );
++}
++
++static const struct window_surface_funcs composed_surface_funcs =
++{
++    composed_surface_set_clip,
++    composed_surface_flush,
++    composed_surface_destroy
++};
++
++static BOOL create_composed_surface( HWND hwnd, const RECT *rect, struct window_surface **surface )
++{
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct window_surface *previous = *surface, *created;
++    unsigned int i;
++
++    if (previous && previous->funcs == &composed_surface_funcs && EqualRect( &previous->rect, rect )) return TRUE;
++
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth       = rect->right - rect->left;
++    info->bmiHeader.biHeight      = -(rect->bottom - rect->top);
++    info->bmiHeader.biPlanes      = 1;
++    info->bmiHeader.biBitCount    = 32;
++    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
++    info->bmiHeader.biCompression = BI_RGB;
++    if (!(created = window_surface_create( sizeof(*created), &composed_surface_funcs, hwnd, rect, info, 0 ))) return FALSE;
++
++    pthread_mutex_lock( &composed_mutex );
++    for (i = 0; i < ARRAY_SIZE(composed_surfaces); i++)
++        if (composed_surfaces[i] && composed_surfaces[i]->hwnd == hwnd) composed_surfaces[i] = NULL;
++    for (i = 0; i < ARRAY_SIZE(composed_surfaces); i++)
++        if (!composed_surfaces[i]) { composed_surfaces[i] = created; break; }
++    pthread_mutex_unlock( &composed_mutex );
++
++    if (previous) window_surface_release( previous );
++    *surface = created;
++    return TRUE;
++}
++
++struct window_surface *get_composed_surface( HWND hwnd )
++{
++    struct window_surface *surface = NULL;
++    unsigned int i;
++
++    pthread_mutex_lock( &composed_mutex );
++    for (i = 0; i < ARRAY_SIZE(composed_surfaces); i++)
++    {
++        if (!composed_surfaces[i] || composed_surfaces[i]->hwnd != hwnd) continue;
++        surface = composed_surfaces[i];
++        window_surface_add_ref( surface );
++        break;
++    }
++    pthread_mutex_unlock( &composed_mutex );
++    return surface;
++}
++
+ /***********************************************************************
+  *      CreateWindowSurface   (X11DRV.@)
+  */
+@@ -2063,6 +2144,11 @@
+     TRACE( "hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect( surface_rect ), surface );
+ 
+     if (!(data = get_win_data( hwnd ))) return TRUE; /* use default surface */
++    if (layered && !data->whole_window && NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
++    {
++        release_win_data( data );
++        return create_composed_surface( hwnd, surface_rect, surface );
++    }
+     if ((previous = *surface) && previous->funcs == &x11drv_surface_funcs)
+     {
+         Window window = get_x11_surface(previous)->window;
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -4044,6 +4044,8 @@
+     if (!data->whole_window)
+     {
+         release_win_data( data );
++        if ((ex_style & WS_EX_LAYERED) && (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW)) && is_ulw_child( hwnd ))
++            x11drv_client_surface_represent_parent( hwnd );
+         return;
+     }
+ 
+@@ -4231,6 +4233,7 @@
+ void X11DRV_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
+ {
+     struct x11drv_win_data *data;
++    BOOL composed;
+ 
+     if (!(data = get_win_data( hwnd ))) return;
+ 
+@@ -4239,8 +4242,11 @@
+         sync_window_opacity( data->display, data->whole_window, alpha, flags );
+         XFlush( data->display );
+     }
++    composed = !data->whole_window;
+ 
+     release_win_data( data );
++
++    if (composed && is_ulw_child( hwnd )) x11drv_client_surface_represent_parent( hwnd );
+ }
+ 
+ 
