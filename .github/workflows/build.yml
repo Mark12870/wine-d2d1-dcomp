@@ -9,7 +9,7 @@ on:
         default: ''
   push:
     branches: [main]
-    paths: [patches/**, build.sh, upstream-commit, .github/workflows/build.yml]
+    paths: [patches/**, upstream-commit]
 
 concurrency:
   group: build
