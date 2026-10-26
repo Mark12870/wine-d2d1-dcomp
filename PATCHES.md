@@ -3,7 +3,9 @@
 `build.sh` applies every file in `patches/` to the giang17/wine checkout before it configures, and
 adds the files to the source archive it ships. A build that carries patches is named `-p<n>`, where
 `n` counts the commits that changed `patches/`. Each section below says what would make the patch
-unnecessary.
+unnecessary, and a probe in `probes/` tells when it has: the Patches workflow builds giang17/wine
+without the patches, and `probes/check.sh` fails, naming the patch, once a probe finds the failure
+gone.
 
 ## winex11-layered-child-compose.patch
 
@@ -32,9 +34,9 @@ Verified on 11.0-887 in Cabinet: Vinyl's "Missing Authorization" panel draws ins
 (431 colours where the stock build gives 1) and a click on it changes the frame. Valhalla
 Supermassive's GL editor, which has no layered child, captures the same with and without the patch.
 
-**When it can go.** When giang17's `d2d1-dcomp-11.0` or upstream Wine composites a layered child
-into its parent. A build without the patch then shows an unauthorised Vinyl's "Missing
-Authorization" panel inside the editor instead of a black frame.
+**When it can go.** When giang17's `d2d1-dcomp-11.0` or upstream Wine keeps a layered child inside
+its parent. `probes/layered-child.c` draws one over an OpenGL parent, and `probes/x-parent.py` asks
+the X server whether the child's window sits outside the parent's: today it does.
 
 ## crypt32-cert-only-pfx.patch
 
@@ -54,5 +56,6 @@ Vinyl shows only its "Trial Mode" card.
 **Patch.** The first commit imports a certificate-only blob into the store. The second checks the
 blob's MAC before it is parsed, as Windows does.
 
-**When it can go.** When giang17's `d2d1-dcomp-11.0` is rebased onto Wine 11.4 or later. The
-Portal then activates Vinyl, and Vinyl's editor shows its full UI.
+**When it can go.** When giang17's `d2d1-dcomp-11.0` is rebased onto Wine 11.4 or later.
+`probes/pfx-cert-only.c` imports a certificate-only PKCS#12 that `check.sh` makes with OpenSSL:
+today Wine refuses it.

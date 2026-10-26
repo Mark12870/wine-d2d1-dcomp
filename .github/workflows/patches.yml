@@ -1,0 +1,137 @@
+name: Patches
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: giang17/wine commit to probe (the branch head when empty)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patches
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/giang17/wine.git
+  BRANCH: d2d1-dcomp-11.0
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+      key: ${{ steps.commit.outputs.key }}
+      probed: ${{ steps.probed.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Find the commit
+        id: commit
+        env:
+          WANTED: ${{ inputs.commit }}
+          PROBES: ${{ hashFiles('probes/**') }}
+        run: |
+          commit=$(git ls-remote "$UPSTREAM" "${WANTED:-refs/heads/$BRANCH}" | cut -f1)
+          commit=${commit:-$WANTED}
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "key=probed-$commit-$PROBES" >> "$GITHUB_OUTPUT"
+
+      - name: Look for an earlier run on it
+        id: probed
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: probes
+          key: ${{ steps.commit.outputs.key }}
+          lookup-only: true
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.probed != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the SDK and LLVM
+        run: flatpak install -y --noninteractive flathub org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm20//25.08
+
+      - name: Fetch the source
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          git clone --quiet --filter=blob:none --branch "$BRANCH" "$UPSTREAM" src
+          git -C src checkout --quiet "$COMMIT"
+
+      - name: Build without the patches
+        run: |
+          rm patches/*.patch
+          mkdir -p tmp dist
+          chmod a+rwx tmp dist
+          flatpak run --filesystem="$PWD" --env=TMPDIR="$PWD/tmp" --command=bash org.gnome.Sdk//50 \
+              ./build.sh src dist
+          rm dist/*-source.tar.zst
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: unpatched
+          path: dist/
+          retention-days: 1
+
+  probe:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: unpatched
+          path: dist
+
+      - name: Install Flatpak, the SDK, Xvfb and MinGW
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -q
+          sudo apt-get install -y -q flatpak xvfb gcc-mingw-w64-x86-64
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.gnome.Sdk//50
+
+      - name: Build the probes
+        run: |
+          mkdir -p built
+          x86_64-w64-mingw32-gcc -O2 -Wall -Werror -o built/pfx-cert-only.exe probes/pfx-cert-only.c -lcrypt32
+          x86_64-w64-mingw32-gcc -O2 -Wall -Werror -o built/layered-child.exe probes/layered-child.c \
+              -lopengl32 -lgdi32
+
+      - name: Probe
+        run: |
+          mkdir wine
+          tar -C wine --zstd -xf dist/*-x86_64.tar.zst
+          Xvfb :99 -screen 0 1280x800x24 &
+          sleep 3
+          DISPLAY=:99 flatpak run --socket=x11 --share=ipc --filesystem="$PWD" --command=bash \
+              org.gnome.Sdk//50 probes/check.sh wine/* built
+
+      - uses: actions/cache/save@v4
+        with:
+          path: probes
+          key: ${{ needs.resolve.outputs.key }}
