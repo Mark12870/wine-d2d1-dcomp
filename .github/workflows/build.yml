@@ -11,6 +11,9 @@ on:
     branches: [main]
     paths: [patches/**, upstream-commit]
 
+permissions:
+  contents: read
+
 concurrency:
   group: build
   cancel-in-progress: false
@@ -22,6 +25,7 @@ env:
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       commit: ${{ steps.version.outputs.commit }}
       version: ${{ steps.version.outputs.version }}
@@ -75,14 +79,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install the SDK and LLVM
         run: flatpak install -y --noninteractive flathub org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm20//25.08
 
       - name: Fetch the source
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           git clone --quiet --filter=blob:none --branch "$BRANCH" "$UPSTREAM" src
-          git -C src checkout --quiet "${{ needs.resolve.outputs.commit }}"
+          git -C src checkout --quiet "$COMMIT"
 
       - name: Build
         run: |
@@ -100,6 +107,7 @@ jobs:
   release:
     needs: [resolve, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
