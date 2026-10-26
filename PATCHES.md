@@ -35,3 +35,24 @@ Supermassive's GL editor, which has no layered child, captures the same with and
 **When it can go.** When giang17's `d2d1-dcomp-11.0` or upstream Wine composites a layered child
 into its parent. A build without the patch then shows an unauthorised Vinyl's "Missing
 Authorization" panel inside the editor instead of a black frame.
+
+## crypt32-cert-only-pfx.patch
+
+Upstream Wine [0b66fb09](https://gitlab.winehq.org/wine/wine/-/commit/0b66fb0932fb8b32e59f06740fbf2e9fd0590422)
+and [986f9b66](https://gitlab.winehq.org/wine/wine/-/commit/986f9b66de3dffe26d339a607cbaf421baa5710a),
+both in Wine 11.4, applied in that order.
+
+**Failure.** `PFXImportCertStore` refuses a PKCS#12 blob that holds certificates but no private
+key; Windows accepts one. Wine 11.0's `open_cert_store` requires
+`gnutls_pkcs12_simple_parse` to return a key, and with none it fails ("The requested data were not
+available").
+
+iZotope's licences are such blobs. iZotope Product Portal fails to activate a product with
+"Response Validation Failed", and a plug-in authorised elsewhere still loads as unauthorised, so
+Vinyl shows only its "Trial Mode" card.
+
+**Patch.** The first commit imports a certificate-only blob into the store. The second checks the
+blob's MAC before it is parsed, as Windows does.
+
+**When it can go.** When giang17's `d2d1-dcomp-11.0` is rebased onto Wine 11.4 or later. The
+Portal then activates Vinyl, and Vinyl's editor shows its full UI.
