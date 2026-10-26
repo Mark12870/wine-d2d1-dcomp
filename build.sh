@@ -12,7 +12,7 @@ export PATH=/usr/lib/sdk/llvm20/bin:$PATH
 version=$(git -C "$source" describe --tags --match 'wine-*' HEAD)
 short=${version%-g*}
 name=wine-d2d1-dcomp-${short#wine-}
-level=$(git -C "$here" rev-list --count HEAD -- patches)
+level=$(git -c safe.directory="$here" -C "$here" rev-list --count HEAD -- patches)
 if [ "$level" -gt 0 ]; then
     name=$name-p$level
 fi
