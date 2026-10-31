@@ -12,7 +12,29 @@
  /**************************************************************************
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
-@@ -674,12 +674,103 @@
+@@ -382,6 +382,11 @@
+     LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
+     LONG offscreen_hidden; /* the surface renders offscreen only because its window is not visible */
+     BOOL vulkan;         /* a Vulkan surface, created without a pixel format */
++
++    pthread_mutex_t underlay_lock; /* guards the fields below, see capture_underlay() */
++    HDC underlay_dc;     /* what other children showed under the layered children before they appeared */
++    HBITMAP underlay_bitmap;
++    RECT underlay_rect;  /* the area underlay_dc holds, in the window's client coordinates */
+ };
+ 
+ /* every x11drv client surface, so that a top-level's VisibilityNotify can find
+@@ -416,6 +421,9 @@
+     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
+     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
+     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
++    if (surface->underlay_dc) NtGdiDeleteObjectApp( surface->underlay_dc );
++    if (surface->underlay_bitmap) NtGdiDeleteObjectApp( surface->underlay_bitmap );
++    pthread_mutex_destroy( &surface->underlay_lock );
+ }
+ 
+ static void x11drv_client_surface_detach( struct client_surface *client )
+@@ -681,14 +689,177 @@
      return changed;
  }
  
@@ -78,6 +100,78 @@
 +    window_surface_release( surface );
 +}
 +
++/* the part of the layered children's rects that other visible children of hwnd
++ * cover, in hwnd's client coordinates; 0 when they cover none of it */
++static HRGN get_covered_region( HWND hwnd, UINT dpi, HRGN ulw_region )
++{
++    HRGN covered = NtGdiCreateRectRgn( 0, 0, 0, 0 ), child_region;
++    HWND child;
++    RECT rect;
++    UINT i = 0;
++
++    if (!covered) return 0;
++    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child && i++ < 64;
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++    {
++        if (!(NtUserGetWindowLongW( child, GWL_STYLE ) & WS_VISIBLE)) continue;
++        if (is_ulw_child( child )) continue;
++        if (!NtUserGetWindowRect( child, &rect, dpi )) continue;
++        NtUserMapWindowPoints( 0, hwnd, (POINT *)&rect, 2, dpi );
++        if (!(child_region = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom ))) continue;
++        NtGdiCombineRgn( covered, covered, child_region, RGN_OR );
++        NtGdiDeleteObjectApp( child_region );
++    }
++    if (NtGdiCombineRgn( covered, covered, ulw_region, RGN_AND ) > NULLREGION) return covered;
++    NtGdiDeleteObjectApp( covered );
++    return 0;
++}
++
++static void drop_underlay( struct x11drv_client_surface *surface )
++{
++    if (surface->underlay_dc) NtGdiDeleteObjectApp( surface->underlay_dc );
++    if (surface->underlay_bitmap) NtGdiDeleteObjectApp( surface->underlay_bitmap );
++    surface->underlay_dc = 0;
++    surface->underlay_bitmap = 0;
++    SetRectEmpty( &surface->underlay_rect );
++}
++
++/* Where another child, a WebView2 browser window for instance, covers the parent
++ * under a layered child, the pixels under the child are that child's, and it may
++ * paint them from another process: only the X window holds them.  Blending over
++ * the X window on every present would blend over the last blend, and a pixel of
++ * alpha 1 turns black within a few seconds.  Keep what those children showed
++ * before the layered child appeared and blend over that copy instead.  iZotope
++ * Trash shows its preset list this way over its whole editor, a WebView2 window
++ * above an OpenGL canvas it never draws into; the editor went black around it. */
++static void capture_underlay( struct x11drv_client_surface *surface, const RECT *rect )
++{
++    HDC dc;
++
++    if (!(dc = NtGdiCreateCompatibleDC( surface->hdc_dst ))) return;
++    if (!(surface->underlay_bitmap = NtGdiCreateCompatibleBitmap( surface->hdc_dst, rect->right - rect->left,
++                                                                  rect->bottom - rect->top )))
++    {
++        NtGdiDeleteObjectApp( dc );
++        return;
++    }
++    NtGdiSelectBitmap( dc, surface->underlay_bitmap );
++    NtGdiBitBlt( dc, 0, 0, rect->right - rect->left, rect->bottom - rect->top, surface->hdc_dst,
++                 rect->left, rect->top, SRCCOPY, 0, 0 );
++    surface->underlay_dc = dc;
++    surface->underlay_rect = *rect;
++}
++
++/* put back what the copy holds, so that nothing blended stays on the X window
++ * or ends up in the next copy */
++static void restore_underlay( struct x11drv_client_surface *surface, HRGN clip )
++{
++    NtGdiExtSelectClipRgn( surface->hdc_dst, clip, RGN_COPY );
++    NtGdiBitBlt( surface->hdc_dst, surface->underlay_rect.left, surface->underlay_rect.top,
++                 surface->underlay_rect.right - surface->underlay_rect.left,
++                 surface->underlay_rect.bottom - surface->underlay_rect.top,
++                 surface->underlay_dc, 0, 0, SRCCOPY, 0, 0 );
++}
++
 +/* repeat the last present of the parent of a layered child, so a change of the
 + * child shows without waiting for the parent's next frame */
 +void x11drv_client_surface_represent_parent( HWND child )
@@ -115,35 +209,84 @@
 +    HWND ulw_children[8];
 +    UINT i, ulw_count = 0;
      Drawable window;
-     HRGN region;
+-    HRGN region;
++    HRGN region, ulw_region = 0, covered = 0;
  
-@@ -704,6 +795,18 @@
+     TRACE( "%s\n", debugstr_client_surface( client ) );
+ 
+@@ -711,6 +882,26 @@
      {
          region = get_dc_monitor_region( hwnd, hdc ); /* otherwise use the window region for clipping rules */
          if (!NtUserGetClientRect( hwnd, &rect_dst, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) )) goto done;
 +        /* the parent presents below its layered children, see is_ulw_child() */
 +        if (region) ulw_count = get_ulw_children( hwnd, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ),
 +                                                  ulw_children, ulw_rects, ARRAY_SIZE(ulw_rects) );
-+        for (i = 0; i < ulw_count; i++)
++        if (ulw_count && (ulw_region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
 +        {
-+            HRGN child_region;
++            for (i = 0; i < ulw_count; i++)
++            {
++                HRGN child_region;
 +
-+            if (!intersect_rect( &rect, &ulw_rects[i], &rect_dst )) continue;
-+            if (!(child_region = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom ))) continue;
-+            NtGdiCombineRgn( region, region, child_region, RGN_OR );
-+            NtGdiDeleteObjectApp( child_region );
++                if (!intersect_rect( &rect, &ulw_rects[i], &rect_dst )) continue;
++                if (!(child_region = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom ))) continue;
++                NtGdiCombineRgn( ulw_region, ulw_region, child_region, RGN_OR );
++                NtGdiDeleteObjectApp( child_region );
++            }
++            /* the parent presents below its layered children only where no other child
++             * covers it, see capture_underlay() */
++            covered = get_covered_region( hwnd, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ), ulw_region );
++            if (covered) NtGdiCombineRgn( ulw_region, ulw_region, covered, RGN_DIFF );
++            NtGdiCombineRgn( region, region, ulw_region, RGN_OR );
 +        }
          NtUserMapWindowPoints( hwnd, toplevel, (POINT *)&rect_dst, 2, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) );
      }
  
-@@ -734,6 +837,7 @@
+@@ -739,8 +930,28 @@
+     if (last_presented_changed( hwnd, surface->window ))
+         NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
  
++    pthread_mutex_lock( &surface->underlay_lock );
++    if (covered) NtGdiGetRgnBox( covered, &rect );
++    if (surface->underlay_dc && (!covered || !EqualRect( &rect, &surface->underlay_rect )))
++    {
++        restore_underlay( surface, 0 );
++        drop_underlay( surface );
++        /* the children below paint again what changed while the copy stood in for them */
++        if (!covered) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
++    }
++    if (covered && !surface->underlay_dc) capture_underlay( surface, &rect );
++    if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
++
      NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                       surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
++    if (covered && surface->underlay_dc)
++    {
++        restore_underlay( surface, covered );
++        NtGdiCombineRgn( region, region, covered, RGN_OR );
++        NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
++    }
 +    for (i = 0; i < ulw_count; i++) blend_ulw_child( surface->hdc_dst, ulw_children[i], &ulw_rects[i] );
++    pthread_mutex_unlock( &surface->underlay_lock );
      XFlush( gdi_display );
  
      /* The top-level may not be viewable yet - the window manager is still
+@@ -751,6 +962,8 @@
+ 
+ done:
+     if (region) NtGdiDeleteObjectApp( region );
++    if (ulw_region) NtGdiDeleteObjectApp( ulw_region );
++    if (covered) NtGdiDeleteObjectApp( covered );
+ }
+ 
+ static const struct client_surface_funcs x11drv_client_surface_funcs =
+@@ -782,6 +995,7 @@
+     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd ))) goto failed;
+     surface->colormap = colormap;
+     surface->vulkan = !format;
++    pthread_mutex_init( &surface->underlay_lock, NULL );
+ 
+     if (!get_surface_rect( hwnd, &surface->rect, NtUserGetDpiForWindow( hwnd ) )) goto failed;
+ 
 --- a/dlls/winex11.drv/bitblt.c
 +++ b/dlls/winex11.drv/bitblt.c
 @@ -2052,6 +2052,87 @@
@@ -248,7 +391,7 @@
          Window window = get_x11_surface(previous)->window;
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
-@@ -4044,6 +4044,8 @@
+@@ -4097,6 +4097,8 @@
      if (!data->whole_window)
      {
          release_win_data( data );
@@ -257,7 +400,7 @@
          return;
      }
  
-@@ -4231,6 +4233,7 @@
+@@ -4284,6 +4286,7 @@
  void X11DRV_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
  {
      struct x11drv_win_data *data;
@@ -265,7 +408,7 @@
  
      if (!(data = get_win_data( hwnd ))) return;
  
-@@ -4239,8 +4242,11 @@
+@@ -4292,8 +4295,11 @@
          sync_window_opacity( data->display, data->whole_window, alpha, flags );
          XFlush( data->display );
      }

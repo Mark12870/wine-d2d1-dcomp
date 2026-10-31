@@ -30,9 +30,19 @@ its visible layered children on top, bottom-most first. When a child's image cha
 or hidden, the parent presents again. Children with `SetLayeredWindowAttributes`, and every other
 window, take the existing paths.
 
+iZotope Trash shows its preset list as a layered child over its whole editor, which is a WebView2
+window above a GL canvas that Trash never draws into. Under the list, the pixels belong to the
+WebView2 window, and only the X window holds them. Blending over them on every present compounds
+the alpha, and the editor turns black within seconds. So where another child covers the GL parent
+under a layered child, the patch keeps what that area showed before the layered child appeared and
+blends over the copy. When the layered children go, it asks those children to repaint the area.
+
 Verified on 11.0-887 in Cabinet: Vinyl's "Missing Authorization" panel draws inside the editor
 (431 colours where the stock build gives 1) and a click on it changes the frame. Valhalla
 Supermassive's GL editor, which has no layered child, captures the same with and without the patch.
+In Bitwig, Trash's editor keeps its pixels around the open preset list for 30 s (13,000 colours
+where the previous patch went black), a click picks a preset, and the editor is whole once the list
+closes.
 
 **When it can go.** When giang17's `d2d1-dcomp-11.0` or upstream Wine keeps a layered child inside
 its parent. `probes/layered-child.c` draws one over an OpenGL parent, and `probes/x-parent.py` asks
