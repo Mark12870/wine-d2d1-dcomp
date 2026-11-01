@@ -7,6 +7,10 @@ unnecessary, and a probe in `probes/` tells when it has: the Patches workflow bu
 without the patches, and `probes/check.sh` fails, naming the patch, once a probe finds the failure
 gone.
 
+Before a patch is written or changed, compare `upstream-commit` with the head of giang17's
+`d2d1-dcomp-11.0`: a newer head may fix the failure itself, retire an existing patch, or no longer
+take the patches as they stand.
+
 ## winex11-layered-child-compose.patch
 
 No WineHQ bug covers layered child windows as of 2026-10. The nearest ones are about layered
