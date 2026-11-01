@@ -25,24 +25,24 @@ the editor stays black while a dialog is up, and the dialog is nowhere to be see
 dismissed. An unauthorised or first-run plug-in never shows its UI.
 
 **Patch.** In `dlls/winex11.drv`, a layered child painted through `UpdateLayeredWindow` gets no X
-window. Its image stays in an offscreen surface, and each time the GL parent presents, it blends
-its visible layered children on top, bottom-most first. When a child's image changes or it is shown
-or hidden, the parent presents again. Children with `SetLayeredWindowAttributes`, and every other
-window, take the existing paths.
+window; its image stays in an offscreen surface. While one is visible, its top-level is redirected
+as the DWM would (`redirect.c`): every painter, the owner's surface flush and GL presents as well as
+the GDI of other processes, draws into a backing pixmap, and the owner writes the X window by
+blending the layered children over that pixmap. XDamage on the pixmap tells the owner that another
+process drew. In `server/window.c`, such a child no longer clips the windows below it out of their
+visible regions, since on Windows it does not either. Children with `SetLayeredWindowAttributes`,
+and every other window, take the existing paths.
 
-iZotope Trash shows its preset list as a layered child over its whole editor, which is a WebView2
-window above a GL canvas that Trash never draws into. Under the list, the pixels belong to the
-WebView2 window, and only the X window holds them. Blending over them on every present compounds
-the alpha, and the editor turns black within seconds. So where another child covers the GL parent
-under a layered child, the patch keeps what that area showed before the layered child appeared and
-blends over the copy. When the layered children go, it asks those children to repaint the area.
+iZotope Trash shows its preset list as a layered child over its whole editor, a WebView2 window of
+another process. Blending over the X window let each WebView2 frame wipe the list, and clipping
+left WebView2 nothing to draw into, so the editor froze behind the list until it closed.
 
 Verified on 11.0-887 in Cabinet: Vinyl's "Missing Authorization" panel draws inside the editor
 (431 colours where the stock build gives 1) and a click on it changes the frame. Valhalla
 Supermassive's GL editor, which has no layered child, captures the same with and without the patch.
-In Bitwig, Trash's editor keeps its pixels around the open preset list for 30 s (13,000 colours
-where the previous patch went black), a click picks a preset, and the editor is whole once the list
-closes.
+In Bitwig, 40 captures of Trash's open preset list 50 ms apart are identical, a preset picked from
+it shows in the editor behind it at once, and after ten quick opens and closes the editor matches
+its capture from before, pixel for pixel.
 
 **When it can go.** When giang17's `d2d1-dcomp-11.0` or upstream Wine keeps a layered child inside
 its parent. `probes/layered-child.c` draws one over an OpenGL parent, and `probes/x-parent.py` asks

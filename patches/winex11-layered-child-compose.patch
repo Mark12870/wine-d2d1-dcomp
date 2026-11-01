@@ -1,40 +1,22 @@
 --- a/dlls/winex11.drv/x11drv.h
 +++ b/dlls/winex11.drv/x11drv.h
-@@ -372,6 +372,9 @@
+@@ -372,6 +372,13 @@
  extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
  extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
  extern void x11drv_client_surface_reblit( HWND toplevel );
 +extern BOOL is_ulw_child( HWND hwnd );
 +extern struct window_surface *get_composed_surface( HWND hwnd );
 +extern void x11drv_client_surface_represent_parent( HWND child );
++extern BOOL x11drv_redirect_update( HWND hwnd );
++extern void x11drv_redirect_destroy( HWND hwnd );
++extern Drawable x11drv_redirect_target( HWND hwnd, Drawable window );
++extern Drawable x11drv_redirect_foreign_target( HWND hwnd, Drawable window );
  extern Window x11drv_client_surface_create( HWND hwnd, int format, struct client_surface **client );
  
  /**************************************************************************
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
-@@ -382,6 +382,11 @@
-     LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
-     LONG offscreen_hidden; /* the surface renders offscreen only because its window is not visible */
-     BOOL vulkan;         /* a Vulkan surface, created without a pixel format */
-+
-+    pthread_mutex_t underlay_lock; /* guards the fields below, see capture_underlay() */
-+    HDC underlay_dc;     /* what other children showed under the layered children before they appeared */
-+    HBITMAP underlay_bitmap;
-+    RECT underlay_rect;  /* the area underlay_dc holds, in the window's client coordinates */
- };
- 
- /* every x11drv client surface, so that a top-level's VisibilityNotify can find
-@@ -416,6 +421,9 @@
-     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
-     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
-     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
-+    if (surface->underlay_dc) NtGdiDeleteObjectApp( surface->underlay_dc );
-+    if (surface->underlay_bitmap) NtGdiDeleteObjectApp( surface->underlay_bitmap );
-+    pthread_mutex_destroy( &surface->underlay_lock );
- }
- 
- static void x11drv_client_surface_detach( struct client_surface *client )
-@@ -681,14 +689,177 @@
+@@ -681,14 +681,133 @@
      return changed;
  }
  
@@ -126,52 +108,6 @@
 +    return 0;
 +}
 +
-+static void drop_underlay( struct x11drv_client_surface *surface )
-+{
-+    if (surface->underlay_dc) NtGdiDeleteObjectApp( surface->underlay_dc );
-+    if (surface->underlay_bitmap) NtGdiDeleteObjectApp( surface->underlay_bitmap );
-+    surface->underlay_dc = 0;
-+    surface->underlay_bitmap = 0;
-+    SetRectEmpty( &surface->underlay_rect );
-+}
-+
-+/* Where another child, a WebView2 browser window for instance, covers the parent
-+ * under a layered child, the pixels under the child are that child's, and it may
-+ * paint them from another process: only the X window holds them.  Blending over
-+ * the X window on every present would blend over the last blend, and a pixel of
-+ * alpha 1 turns black within a few seconds.  Keep what those children showed
-+ * before the layered child appeared and blend over that copy instead.  iZotope
-+ * Trash shows its preset list this way over its whole editor, a WebView2 window
-+ * above an OpenGL canvas it never draws into; the editor went black around it. */
-+static void capture_underlay( struct x11drv_client_surface *surface, const RECT *rect )
-+{
-+    HDC dc;
-+
-+    if (!(dc = NtGdiCreateCompatibleDC( surface->hdc_dst ))) return;
-+    if (!(surface->underlay_bitmap = NtGdiCreateCompatibleBitmap( surface->hdc_dst, rect->right - rect->left,
-+                                                                  rect->bottom - rect->top )))
-+    {
-+        NtGdiDeleteObjectApp( dc );
-+        return;
-+    }
-+    NtGdiSelectBitmap( dc, surface->underlay_bitmap );
-+    NtGdiBitBlt( dc, 0, 0, rect->right - rect->left, rect->bottom - rect->top, surface->hdc_dst,
-+                 rect->left, rect->top, SRCCOPY, 0, 0 );
-+    surface->underlay_dc = dc;
-+    surface->underlay_rect = *rect;
-+}
-+
-+/* put back what the copy holds, so that nothing blended stays on the X window
-+ * or ends up in the next copy */
-+static void restore_underlay( struct x11drv_client_surface *surface, HRGN clip )
-+{
-+    NtGdiExtSelectClipRgn( surface->hdc_dst, clip, RGN_COPY );
-+    NtGdiBitBlt( surface->hdc_dst, surface->underlay_rect.left, surface->underlay_rect.top,
-+                 surface->underlay_rect.right - surface->underlay_rect.left,
-+                 surface->underlay_rect.bottom - surface->underlay_rect.top,
-+                 surface->underlay_dc, 0, 0, SRCCOPY, 0, 0 );
-+}
-+
 +/* repeat the last present of the parent of a layered child, so a change of the
 + * child shows without waiting for the parent's next frame */
 +void x11drv_client_surface_represent_parent( HWND child )
@@ -179,6 +115,8 @@
 +    struct x11drv_client_surface *surface, *pending[16];
 +    HWND parent = NtUserGetAncestor( child, GA_PARENT );
 +    unsigned int i, count = 0;
++
++    if (x11drv_redirect_update( NtUserGetAncestor( child, GA_ROOT ) )) return;
 +
 +    pthread_mutex_lock( &client_surfaces_x11_lock );
 +    LIST_FOR_EACH_ENTRY( surface, &client_surfaces_x11, struct x11drv_client_surface, entry )
@@ -205,16 +143,25 @@
      HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
      struct x11drv_win_data *data;
 -    RECT rect_dst, rect;
+-    Drawable window;
+-    HRGN region;
 +    RECT rect_dst, rect, ulw_rects[8];
 +    HWND ulw_children[8];
 +    UINT i, ulw_count = 0;
-     Drawable window;
--    HRGN region;
++    Drawable window, target;
 +    HRGN region, ulw_region = 0, covered = 0;
  
      TRACE( "%s\n", debugstr_client_surface( client ) );
  
-@@ -711,6 +882,26 @@
+@@ -700,6 +819,7 @@
+     if (!hdc) return;
+     if (!surface->hdc_dst) return; /* non-offscreen, GL presents directly */
+     window = X11DRV_get_whole_window( toplevel );
++    target = x11drv_redirect_target( toplevel, window );
+ 
+     if (NtUserGetPresentRect( toplevel, &rect_dst, -1 /* raw dpi */ ))
+     {
+@@ -711,6 +831,26 @@
      {
          region = get_dc_monitor_region( hwnd, hdc ); /* otherwise use the window region for clipping rules */
          if (!NtUserGetClientRect( hwnd, &rect_dst, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) )) goto done;
@@ -233,7 +180,7 @@
 +                NtGdiDeleteObjectApp( child_region );
 +            }
 +            /* the parent presents below its layered children only where no other child
-+             * covers it, see capture_underlay() */
++             * covers it: those pixels are the other child's */
 +            covered = get_covered_region( hwnd, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ), ulw_region );
 +            if (covered) NtGdiCombineRgn( ulw_region, ulw_region, covered, RGN_DIFF );
 +            NtGdiCombineRgn( region, region, ulw_region, RGN_OR );
@@ -241,36 +188,27 @@
          NtUserMapWindowPoints( hwnd, toplevel, (POINT *)&rect_dst, 2, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) );
      }
  
-@@ -739,8 +930,28 @@
-     if (last_presented_changed( hwnd, surface->window ))
-         NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+@@ -721,8 +861,8 @@
+         release_win_data( data );
+     }
  
-+    pthread_mutex_lock( &surface->underlay_lock );
-+    if (covered) NtGdiGetRgnBox( covered, &rect );
-+    if (surface->underlay_dc && (!covered || !EqualRect( &rect, &surface->underlay_rect )))
-+    {
-+        restore_underlay( surface, 0 );
-+        drop_underlay( surface );
-+        /* the children below paint again what changed while the copy stood in for them */
-+        if (!covered) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
-+    }
-+    if (covered && !surface->underlay_dc) capture_underlay( surface, &rect );
-+    if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
-+
+-    if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+-        set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
++    if (get_dc_drawable( surface->hdc_dst, &rect ) != target || !EqualRect( &rect, &rect_dst ))
++        set_dc_drawable( surface->hdc_dst, target, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+ 
+     /* A client surface that has just replaced the one this window was presenting
+@@ -741,6 +881,8 @@
+ 
      NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                       surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
-+    if (covered && surface->underlay_dc)
-+    {
-+        restore_underlay( surface, covered );
-+        NtGdiCombineRgn( region, region, covered, RGN_OR );
-+        NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
-+    }
-+    for (i = 0; i < ulw_count; i++) blend_ulw_child( surface->hdc_dst, ulw_children[i], &ulw_rects[i] );
-+    pthread_mutex_unlock( &surface->underlay_lock );
++    if (target == window)
++        for (i = 0; i < ulw_count; i++) blend_ulw_child( surface->hdc_dst, ulw_children[i], &ulw_rects[i] );
      XFlush( gdi_display );
  
      /* The top-level may not be viewable yet - the window manager is still
-@@ -751,6 +962,8 @@
+@@ -751,6 +893,8 @@
  
  done:
      if (region) NtGdiDeleteObjectApp( region );
@@ -279,17 +217,29 @@
  }
  
  static const struct client_surface_funcs x11drv_client_surface_funcs =
-@@ -782,6 +995,7 @@
-     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd ))) goto failed;
-     surface->colormap = colormap;
-     surface->vulkan = !format;
-+    pthread_mutex_init( &surface->underlay_lock, NULL );
- 
-     if (!get_surface_rect( hwnd, &surface->rect, NtUserGetDpiForWindow( hwnd ) )) goto failed;
- 
 --- a/dlls/winex11.drv/bitblt.c
 +++ b/dlls/winex11.drv/bitblt.c
-@@ -2052,6 +2052,87 @@
+@@ -1808,6 +1808,7 @@
+     XImage *ximage = surface->image->ximage;
+     const unsigned char *src = color_bits;
+     unsigned char *dst = (unsigned char *)ximage->data;
++    Drawable target;
+ 
+     if (alpha_bits == -1)
+     {
+@@ -1866,8 +1867,9 @@
+                 if (!(shape[x / 8] & (0x80 >> (x % 8)))) ptr[x] = 0;
+     }
+ 
+-    if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
+-        XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
++    target = x11drv_redirect_target( window_surface->hwnd, surface->window );
++    if (!put_shm_image( ximage, &surface->image->shminfo, target, surface->gc, rect, dirty ))
++        XPutImage( gdi_display, target, surface->gc, ximage, dirty->left,
+                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
+                    dirty->right - dirty->left, dirty->bottom - dirty->top );
+ 
+@@ -2052,6 +2054,87 @@
      return FALSE;
  }
  
@@ -377,7 +327,7 @@
  /***********************************************************************
   *      CreateWindowSurface   (X11DRV.@)
   */
-@@ -2063,6 +2144,11 @@
+@@ -2063,6 +2146,11 @@
      TRACE( "hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect( surface_rect ), surface );
  
      if (!(data = get_win_data( hwnd ))) return TRUE; /* use default surface */
@@ -391,16 +341,60 @@
          Window window = get_x11_surface(previous)->window;
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
-@@ -4097,6 +4097,8 @@
+@@ -3357,6 +3357,7 @@
+     struct x11drv_thread_data *thread_data = x11drv_thread_data();
+     struct x11drv_win_data *data;
+ 
++    x11drv_redirect_destroy( hwnd );
+     if (!(data = get_win_data( hwnd ))) return;
+ 
+     destroy_whole_window( data, FALSE );
+@@ -3785,6 +3786,7 @@
+         /* special case: when repainting the root window, clip out top-level windows */
+         if (top == hwnd && data->whole_window == root_window) escape.mode = ClipByChildren;
+         release_win_data( data );
++        escape.drawable = x11drv_redirect_target( top, escape.drawable );
+     }
+     else
+     {
+@@ -3802,7 +3804,7 @@
+          * client-side lookup, no round trip. */
+         VisualID visualid = (VisualID)(ULONG_PTR)NtUserGetProp( top, visual_id_prop );
+ 
+-        escape.drawable = X11DRV_get_whole_window( top );
++        escape.drawable = x11drv_redirect_foreign_target( top, X11DRV_get_whole_window( top ) );
+         escape.visual = default_visual;
+         if (visualid && visualid != default_visual.visualid)
+         {
+@@ -4041,6 +4043,7 @@
+     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     struct window_rects old_rects;
+     BOOL is_managed, was_fullscreen, activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
++    Window window;
+ 
+     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
+ 
+@@ -4097,6 +4100,7 @@
      if (!data->whole_window)
      {
          release_win_data( data );
-+        if ((ex_style & WS_EX_LAYERED) && (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW)) && is_ulw_child( hwnd ))
-+            x11drv_client_surface_represent_parent( hwnd );
++        if ((ex_style & WS_EX_LAYERED) && is_ulw_child( hwnd )) x11drv_client_surface_represent_parent( hwnd );
          return;
      }
  
-@@ -4284,6 +4286,7 @@
+@@ -4131,9 +4135,11 @@
+     was_fullscreen &= data->desired_state.wm_state != NormalState;
+ 
+     XFlush( data->display );  /* make sure changes are done before we start painting again */
++    window = data->whole_window;
+     release_win_data( data );
+ 
+     if (was_fullscreen) NtUserClipCursor( NULL );
++    if (x11drv_redirect_target( hwnd, window ) != window) x11drv_redirect_update( hwnd );
+ }
+ 
+ /* check if the window icon should be hidden (i.e. moved off-screen) */
+@@ -4284,6 +4290,7 @@
  void X11DRV_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
  {
      struct x11drv_win_data *data;
@@ -408,7 +402,7 @@
  
      if (!(data = get_win_data( hwnd ))) return;
  
-@@ -4292,8 +4295,11 @@
+@@ -4292,8 +4299,11 @@
          sync_window_opacity( data->display, data->whole_window, alpha, flags );
          XFlush( data->display );
      }
@@ -420,3 +414,536 @@
  }
  
  
+--- a/dlls/winex11.drv/Makefile.in
++++ b/dlls/winex11.drv/Makefile.in
+@@ -18,6 +18,7 @@
+ 	opengl.c \
+ 	palette.c \
+ 	pen.c \
++	redirect.c \
+ 	vd_compositor.c \
+ 	version.rc \
+ 	vulkan.c \
+--- a/dlls/winex11.drv/redirect.c
++++ b/dlls/winex11.drv/redirect.c
+@@ -0,0 +1,508 @@
++/*
++ * Composition of layered child windows over their top-level.
++ *
++ * On Windows 8 and later the DWM blends a child painted through
++ * UpdateLayeredWindow() over everything its top-level shows, including the
++ * children of other processes, live.  Here such a child has no X window (see
++ * is_ulw_child()), so while one is visible the top-level is redirected: every
++ * painter, the owner's surface flush, its GL presents and the GDI of other
++ * processes alike, draws into a backing pixmap published on the top-level, and
++ * only the owner writes the X window, composing that pixmap with an overlay
++ * holding the layered children.  XDamage on the backing pixmap is the only
++ * notice the owner gets of another process drawing; a thread of its own waits
++ * for it on a connection of its own, since the application's threads read
++ * their X events only when they pump messages, and a plug-in host's GUI thread
++ * may do that seldom.  iZotope Trash shows its preset list this way over a
++ * WebView2 window of another process; blending over the X window instead let
++ * every WebView2 frame wipe the list and every GL present wipe the frame.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <X11/Xlib.h>
++
++#include "x11drv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
++
++static const WCHAR backing_prop[] =
++    {'_','_','w','i','n','e','_','x','1','1','_','b','a','c','k','i','n','g',0};
++
++#if defined(SONAME_LIBXRENDER) && defined(SONAME_LIBXDAMAGE)
++
++#include <X11/extensions/Xrender.h>
++#include <X11/extensions/Xdamage.h>
++
++#define MAKE_FUNCPTR(f) static typeof(f) * p##f;
++MAKE_FUNCPTR(XRenderQueryExtension)
++MAKE_FUNCPTR(XRenderFindVisualFormat)
++MAKE_FUNCPTR(XRenderFindStandardFormat)
++MAKE_FUNCPTR(XRenderCreatePicture)
++MAKE_FUNCPTR(XRenderFreePicture)
++MAKE_FUNCPTR(XRenderFillRectangle)
++MAKE_FUNCPTR(XRenderComposite)
++MAKE_FUNCPTR(XDamageQueryExtension)
++MAKE_FUNCPTR(XDamageCreate)
++MAKE_FUNCPTR(XDamageDestroy)
++#undef MAKE_FUNCPTR
++
++#define MAX_REDIRECTS 8
++#define MAX_LAYERED 8
++#define RETIRE_TICKS 2000
++
++struct redirect
++{
++    HWND hwnd;
++    Window window;
++    int width, height, depth;
++    Pixmap backing, overlay, scratch;
++    Picture backing_pict, overlay_pict, scratch_pict;
++    GC gc, overlay_gc;
++    Damage damage;
++    RECT pending;
++    RECT layered;
++};
++
++struct retired
++{
++    Pixmap pixmap;
++    DWORD since;
++};
++
++static pthread_mutex_t redirect_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_once_t redirect_once = PTHREAD_ONCE_INIT;
++static struct redirect redirects[MAX_REDIRECTS];
++static struct retired retired[3 * MAX_REDIRECTS];
++static BOOL redirect_ready;
++static Display *damage_display;
++static int damage_event_base;
++
++static void union_rect( RECT *dst, const RECT *src1, const RECT *src2 )
++{
++    if (IsRectEmpty( src1 )) *dst = *src2;
++    else if (!IsRectEmpty( src2 ))
++        SetRect( dst, min( src1->left, src2->left ), min( src1->top, src2->top ),
++                 max( src1->right, src2->right ), max( src1->bottom, src2->bottom ) );
++    else *dst = *src1;
++}
++
++struct top_level
++{
++    Window window;
++    XVisualInfo vis;
++    struct window_rects rects;
++};
++
++static void *listen_damage( void *arg );
++
++static void redirect_load(void)
++{
++    pthread_t thread;
++    void *xr = dlopen( SONAME_LIBXRENDER, RTLD_NOW ), *xd = dlopen( SONAME_LIBXDAMAGE, RTLD_NOW );
++    int error_base;
++
++    if (!xr || !xd) return;
++#define LOAD(h, f) if (!(p##f = dlsym( h, #f ))) return
++    LOAD( xr, XRenderQueryExtension );
++    LOAD( xr, XRenderFindVisualFormat );
++    LOAD( xr, XRenderFindStandardFormat );
++    LOAD( xr, XRenderCreatePicture );
++    LOAD( xr, XRenderFreePicture );
++    LOAD( xr, XRenderFillRectangle );
++    LOAD( xr, XRenderComposite );
++    LOAD( xd, XDamageQueryExtension );
++    LOAD( xd, XDamageCreate );
++    LOAD( xd, XDamageDestroy );
++#undef LOAD
++    if (!pXRenderQueryExtension( gdi_display, &error_base, &error_base )) return;
++    if (!(damage_display = XOpenDisplay( XDisplayString( gdi_display ) ))) return;
++    if (!pXDamageQueryExtension( damage_display, &damage_event_base, &error_base )) return;
++    if (pthread_create( &thread, NULL, listen_damage, NULL )) return;
++    pthread_detach( thread );
++    redirect_ready = TRUE;
++}
++
++static struct redirect *find_redirect( HWND hwnd )
++{
++    unsigned int i;
++
++    for (i = 0; i < MAX_REDIRECTS; i++) if (redirects[i].hwnd == hwnd) return &redirects[i];
++    return NULL;
++}
++
++static void retire_pixmap( Pixmap pixmap )
++{
++    unsigned int i, oldest = 0;
++
++    if (!pixmap) return;
++    for (i = 0; i < ARRAY_SIZE(retired); i++)
++    {
++        if (!retired[i].pixmap) break;
++        if ((int)(retired[i].since - retired[oldest].since) < 0) oldest = i;
++    }
++    if (i == ARRAY_SIZE(retired))
++    {
++        XFreePixmap( gdi_display, retired[oldest].pixmap );
++        i = oldest;
++    }
++    retired[i].pixmap = pixmap;
++    retired[i].since = NtGetTickCount();
++}
++
++static void reap_retired(void)
++{
++    DWORD now = NtGetTickCount();
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(retired); i++)
++    {
++        if (!retired[i].pixmap || now - retired[i].since < RETIRE_TICKS) continue;
++        XFreePixmap( gdi_display, retired[i].pixmap );
++        retired[i].pixmap = 0;
++    }
++}
++
++static void release_buffers( struct redirect *r, BOOL retire )
++{
++    if (r->backing_pict) pXRenderFreePicture( gdi_display, r->backing_pict );
++    if (r->overlay_pict) pXRenderFreePicture( gdi_display, r->overlay_pict );
++    if (r->scratch_pict) pXRenderFreePicture( gdi_display, r->scratch_pict );
++    if (r->overlay_gc) XFreeGC( gdi_display, r->overlay_gc );
++    if (retire)
++    {
++        retire_pixmap( r->backing );
++        retire_pixmap( r->overlay );
++    }
++    else
++    {
++        if (r->backing) XFreePixmap( gdi_display, r->backing );
++        if (r->overlay) XFreePixmap( gdi_display, r->overlay );
++    }
++    if (r->scratch) XFreePixmap( gdi_display, r->scratch );
++    r->backing = r->overlay = r->scratch = 0;
++    r->backing_pict = r->overlay_pict = r->scratch_pict = 0;
++    r->overlay_gc = 0;
++}
++
++static BOOL create_buffers( struct redirect *r, const XVisualInfo *vis, Pixmap previous, int previous_width,
++                            int previous_height )
++{
++    XRenderPictFormat *format = pXRenderFindVisualFormat( gdi_display, vis->visual );
++    XRenderPictFormat *argb = pXRenderFindStandardFormat( gdi_display, PictStandardARGB32 );
++
++    if (!format || !argb) return FALSE;
++    r->backing = XCreatePixmap( gdi_display, r->window, r->width, r->height, r->depth );
++    r->scratch = XCreatePixmap( gdi_display, r->window, r->width, r->height, r->depth );
++    r->overlay = XCreatePixmap( gdi_display, r->window, r->width, r->height, 32 );
++    if (previous)
++        XCopyArea( gdi_display, previous, r->backing, r->gc, 0, 0, min( r->width, previous_width ),
++                   min( r->height, previous_height ), 0, 0 );
++    else
++        XCopyArea( gdi_display, r->window, r->backing, r->gc, 0, 0, r->width, r->height, 0, 0 );
++    r->backing_pict = pXRenderCreatePicture( gdi_display, r->backing, format, 0, NULL );
++    r->scratch_pict = pXRenderCreatePicture( gdi_display, r->scratch, format, 0, NULL );
++    r->overlay_pict = pXRenderCreatePicture( gdi_display, r->overlay, argb, 0, NULL );
++    r->overlay_gc = XCreateGC( gdi_display, r->overlay, 0, NULL );
++    return TRUE;
++}
++
++static void compose( struct redirect *r, const RECT *area )
++{
++    RECT rect = { 0, 0, r->width, r->height };
++    int width, height;
++
++    if (!intersect_rect( &rect, &rect, area )) return;
++    width = rect.right - rect.left;
++    height = rect.bottom - rect.top;
++    pXRenderComposite( gdi_display, PictOpSrc, r->backing_pict, None, r->scratch_pict,
++                       rect.left, rect.top, 0, 0, rect.left, rect.top, width, height );
++    pXRenderComposite( gdi_display, PictOpOver, r->overlay_pict, None, r->scratch_pict,
++                       rect.left, rect.top, 0, 0, rect.left, rect.top, width, height );
++    XCopyArea( gdi_display, r->scratch, r->window, r->gc, rect.left, rect.top, width, height,
++               rect.left, rect.top );
++}
++
++static UINT collect_layered( HWND parent, HWND *children, UINT count, UINT depth )
++{
++    HWND child, list[64];
++    UINT i = 0;
++
++    for (child = NtUserGetWindowRelative( parent, GW_CHILD ); child && i < ARRAY_SIZE(list);
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++        list[i++] = child;
++
++    while (i-- && count < MAX_LAYERED)
++    {
++        if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
++        if (is_ulw_child( list[i] )) children[count++] = list[i];
++        else if (depth) count = collect_layered( list[i], children, count, depth - 1 );
++    }
++    return count;
++}
++
++static void draw_layered( struct redirect *r, HWND child, const POINT *origin, UINT dpi )
++{
++    struct window_surface *surface;
++    DIBSECTION dib;
++    XImage *image;
++    Pixmap pixmap;
++    Picture picture;
++    RECT rect;
++    int width, height;
++
++    if (!NtUserGetWindowRect( child, &rect, dpi )) return;
++    if (!(surface = get_composed_surface( child ))) return;
++    OffsetRect( &rect, -origin->x, -origin->y );
++    width = min( rect.right - rect.left, surface->rect.right - surface->rect.left );
++    height = min( rect.bottom - rect.top, surface->rect.bottom - surface->rect.top );
++
++    window_surface_lock( surface );
++    if (width > 0 && height > 0 &&
++        NtGdiExtGetObjectW( surface->color_bitmap, sizeof(dib), &dib ) == sizeof(dib) &&
++        dib.dsBm.bmBits && dib.dsBm.bmBitsPixel == 32 &&
++        (image = XCreateImage( gdi_display, NULL, 32, ZPixmap, 0, dib.dsBm.bmBits, dib.dsBm.bmWidth,
++                               dib.dsBm.bmHeight, 32, dib.dsBm.bmWidthBytes )))
++    {
++        image->byte_order = LSBFirst;
++        pixmap = XCreatePixmap( gdi_display, r->window, width, height, 32 );
++        XPutImage( gdi_display, pixmap, r->overlay_gc, image, 0, 0, 0, 0, width, height );
++        image->data = NULL;
++        XDestroyImage( image );
++        picture = pXRenderCreatePicture( gdi_display, pixmap,
++                                         pXRenderFindStandardFormat( gdi_display, PictStandardARGB32 ), 0, NULL );
++        pXRenderComposite( gdi_display, PictOpOver, picture, None, r->overlay_pict, 0, 0, 0, 0,
++                           rect.left, rect.top, width, height );
++        pXRenderFreePicture( gdi_display, picture );
++        XFreePixmap( gdi_display, pixmap );
++        SetRect( &rect, rect.left, rect.top, rect.left + width, rect.top + height );
++        union_rect( &r->layered, &r->layered, &rect );
++    }
++    window_surface_unlock( surface );
++    window_surface_release( surface );
++}
++
++static void draw_overlay( struct redirect *r, const HWND *children, UINT count, const POINT *origin, UINT dpi )
++{
++    static const XRenderColor transparent;
++    UINT i;
++
++    SetRectEmpty( &r->layered );
++    pXRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &transparent, 0, 0, r->width, r->height );
++    for (i = 0; i < count; i++) draw_layered( r, children[i], origin, dpi );
++}
++
++static void stop_redirect( struct redirect *r )
++{
++    RECT all = { 0, 0, r->width, r->height };
++
++    TRACE( "hwnd %p stops composing its layered children\n", r->hwnd );
++    NtUserRemoveProp( r->hwnd, backing_prop );
++    pXDamageDestroy( damage_display, r->damage );
++    XFlush( damage_display );
++    XCopyArea( gdi_display, r->backing, r->window, r->gc, 0, 0, all.right, all.bottom, 0, 0 );
++    XFreeGC( gdi_display, r->gc );
++    release_buffers( r, TRUE );
++    memset( r, 0, sizeof(*r) );
++}
++
++static struct redirect *start_redirect( HWND hwnd, const struct top_level *data, int width, int height )
++{
++    struct redirect *r = find_redirect( 0 );
++
++    if (!r) return NULL;
++    r->hwnd = hwnd;
++    r->window = data->window;
++    r->width = width;
++    r->height = height;
++    r->depth = data->vis.depth;
++    r->gc = XCreateGC( gdi_display, r->window, 0, NULL );
++    XSetSubwindowMode( gdi_display, r->gc, IncludeInferiors );
++    XSetGraphicsExposures( gdi_display, r->gc, False );
++    if (!create_buffers( r, &data->vis, 0, 0, 0 ))
++    {
++        XFreeGC( gdi_display, r->gc );
++        release_buffers( r, FALSE );
++        memset( r, 0, sizeof(*r) );
++        return NULL;
++    }
++    XSync( gdi_display, False );
++    r->damage = pXDamageCreate( damage_display, r->backing, XDamageReportRawRectangles );
++    XFlush( damage_display );
++    NtUserSetProp( hwnd, backing_prop, (HANDLE)r->backing );
++    TRACE( "hwnd %p composes its layered children, backing %lx\n", hwnd, r->backing );
++    return r;
++}
++
++static void resize_redirect( struct redirect *r, const struct top_level *data, int width, int height )
++{
++    struct redirect previous = *r;
++
++    pXDamageDestroy( damage_display, r->damage );
++    r->width = width;
++    r->height = height;
++    r->backing = r->overlay = r->scratch = 0;
++    r->backing_pict = r->overlay_pict = r->scratch_pict = 0;
++    r->overlay_gc = 0;
++    create_buffers( r, &data->vis, previous.backing, previous.width, previous.height );
++    XSync( gdi_display, False );
++    r->damage = pXDamageCreate( damage_display, r->backing, XDamageReportRawRectangles );
++    XFlush( damage_display );
++    NtUserSetProp( r->hwnd, backing_prop, (HANDLE)r->backing );
++    release_buffers( &previous, TRUE );
++}
++
++/* bring the composition of hwnd, a top-level of this process, in line with its
++ * visible layered children; FALSE when it is not composed */
++BOOL x11drv_redirect_update( HWND hwnd )
++{
++    HWND children[MAX_LAYERED];
++    struct x11drv_win_data *win_data;
++    struct top_level top, *data = &top;
++    struct redirect *r;
++    RECT old, area, window_rect;
++    POINT origin;
++    UINT count, dpi;
++    Window root;
++    int x, y;
++    unsigned int width, height, border, depth;
++    BOOL composed;
++
++    pthread_once( &redirect_once, redirect_load );
++    if (!redirect_ready) return FALSE;
++
++    dpi = NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI );
++    count = NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE ? collect_layered( hwnd, children, 0, 4 ) : 0;
++    if (!NtUserGetWindowRect( hwnd, &window_rect, dpi )) return FALSE;
++    if (!(win_data = get_win_data( hwnd ))) return FALSE;
++    top.window = win_data->whole_window;
++    top.vis = win_data->vis;
++    top.rects = win_data->rects;
++    release_win_data( win_data );
++
++    pthread_mutex_lock( &redirect_mutex );
++    reap_retired();
++    r = find_redirect( hwnd );
++    if (!count || !data->window || data->window == root_window)
++    {
++        if (r) stop_redirect( r );
++        r = NULL;
++    }
++    else if (XGetGeometry( gdi_display, data->window, &root, &x, &y, &width, &height, &border, &depth ))
++    {
++        if (!r) r = start_redirect( hwnd, data, width, height );
++        else if (r->width != width || r->height != height) resize_redirect( r, data, width, height );
++    }
++    if (r)
++    {
++        origin.x = window_rect.left + data->rects.visible.left - data->rects.window.left;
++        origin.y = window_rect.top + data->rects.visible.top - data->rects.window.top;
++        old = r->layered;
++        draw_overlay( r, children, count, &origin, dpi );
++        union_rect( &area, &old, &r->layered );
++        compose( r, &area );
++        XFlush( gdi_display );
++    }
++    composed = r != NULL;
++    pthread_mutex_unlock( &redirect_mutex );
++    return composed;
++}
++
++void x11drv_redirect_destroy( HWND hwnd )
++{
++    struct redirect *r;
++
++    if (!redirect_ready) return;
++    pthread_mutex_lock( &redirect_mutex );
++    if ((r = find_redirect( hwnd )))
++    {
++        NtUserRemoveProp( hwnd, backing_prop );
++        pXDamageDestroy( damage_display, r->damage );
++        XFlush( damage_display );
++        XFreeGC( gdi_display, r->gc );
++        release_buffers( r, TRUE );
++        memset( r, 0, sizeof(*r) );
++    }
++    pthread_mutex_unlock( &redirect_mutex );
++}
++
++/* the drawable that painters of hwnd, a top-level of this process, write into */
++Drawable x11drv_redirect_target( HWND hwnd, Drawable window )
++{
++    struct redirect *r;
++    Drawable target = window;
++
++    if (!redirect_ready) return window;
++    pthread_mutex_lock( &redirect_mutex );
++    if ((r = find_redirect( hwnd )) && r->window == window) target = r->backing;
++    pthread_mutex_unlock( &redirect_mutex );
++    return target;
++}
++
++static void handle_damage( const XDamageNotifyEvent *damage )
++{
++    struct redirect *r;
++    RECT rect;
++    unsigned int i;
++
++    pthread_mutex_lock( &redirect_mutex );
++    for (i = 0; i < MAX_REDIRECTS; i++)
++    {
++        r = &redirects[i];
++        if (!r->hwnd || r->damage != damage->damage) continue;
++        SetRect( &rect, damage->area.x, damage->area.y, damage->area.x + damage->area.width,
++                 damage->area.y + damage->area.height );
++        union_rect( &r->pending, &r->pending, &rect );
++        if (damage->more) break;
++        compose( r, &r->pending );
++        SetRectEmpty( &r->pending );
++        XFlush( gdi_display );
++        break;
++    }
++    pthread_mutex_unlock( &redirect_mutex );
++}
++
++static void *listen_damage( void *arg )
++{
++    XEvent event;
++
++    for (;;)
++    {
++        XNextEvent( damage_display, &event );
++        if (event.type == damage_event_base + XDamageNotify) handle_damage( (XDamageNotifyEvent *)&event );
++    }
++    return NULL;
++}
++
++#else
++
++BOOL x11drv_redirect_update( HWND hwnd )
++{
++    return FALSE;
++}
++
++void x11drv_redirect_destroy( HWND hwnd )
++{
++}
++
++Drawable x11drv_redirect_target( HWND hwnd, Drawable window )
++{
++    return window;
++}
++
++#endif
++
++/* the drawable that painters of hwnd, a top-level of another process, write into */
++Drawable x11drv_redirect_foreign_target( HWND hwnd, Drawable window )
++{
++    Drawable backing = (Drawable)NtUserGetProp( hwnd, backing_prop );
++
++    return backing ? backing : window;
++}
+--- a/server/window.c
++++ b/server/window.c
+@@ -1233,6 +1233,9 @@
+         if (ptr == last) break;
+         if (!(ptr->style & WS_VISIBLE)) continue;
+         if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
++        /* the DWM blends a child painted through UpdateLayeredWindow() over what lies
++         * below it, so it does not clip that; winex11's redirect.c does the blending */
++        if (!is_desktop_window( parent ) && (ptr->ex_style & WS_EX_LAYERED) && !ptr->is_layered) continue;
+         set_region_rect( tmp, &ptr->visible_rect );
+         if (ptr->win_region && !intersect_window_region( tmp, ptr ))
+         {
